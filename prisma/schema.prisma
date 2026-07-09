@@ -1,11 +1,7 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
-
 generator client {
-  provider = "prisma-client-js"
-  engineType = "library"
+  provider        = "prisma-client-js"
+  engineType      = "library"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -21,11 +17,15 @@ model User {
 model Video {
   id            String   @id @default(uuid())
   userId        String   @unique
-  filePath      String
-  thumbPath     String?
+  status        String   @default("processing") // "processing" | "ready" | "failed"
+  rawKey        String?
+  videoKey      String?
+  thumbnailKey  String?
   duration      Int?
-  fileSizeBytes Int
+  fileSizeBytes Int?
+  errorMessage  String?
   createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

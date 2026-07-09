@@ -1,71 +1,88 @@
-import { mkdir, unlink, writeFile } from "fs/promises";
-import path from "path";
-import { randomUUID } from "crypto";
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-const DATA_ROOT = path.join(process.cwd(), "data");
-const VIDEO_ROOT = path.join(DATA_ROOT, "videos");
+const requiredEnvVars = [
+  "R2_ACCOUNT_ID",
+  "R2_ACCESS_KEY_ID",
+  "R2_SECRET_ACCESS_KEY",
+  "R2_BUCKET_NAME",
+] as const;
 
-function normalizeExtension(ext: string): string {
-  const trimmedExt = ext.trim().replace(/^\./, "");
-
-  if (!trimmedExt) {
-    throw new Error("File extension is required.");
+for (const key of requiredEnvVars) {
+  if (!process.env[key]) {
+    throw new Error(`${key} is not set.`);
   }
-
-  return trimmedExt;
 }
 
-function getRelativeKey(userId: string, fileName: string): string {
-  return path.posix.join("videos", userId, fileName);
-}
+const accountId = process.env.R2_ACCOUNT_ID as string;
+const bucketName = process.env.R2_BUCKET_NAME as string;
 
-function getUserPrefix(userId: string): string {
-  return path.posix.join("videos", userId) + "/";
-}
+const s3Client = new S3Client({
+  region: "auto",
+  endpoint: `https://${accountId}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID as string,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY as string,
+  },
+});
 
-export async function saveFile(userId: string, buffer: Buffer, ext: string): Promise<string> {
-  if (!userId.trim()) {
-    throw new Error("User ID is required to save a file.");
+export async function saveFile(key: string, buffer: Buffer): Promise<void> {
+  if (!key.trim()) {
+    throw new Error("A storage key is required to save a file.");
   }
 
   if (buffer.length === 0) {
     throw new Error("Cannot save an empty file.");
   }
 
-  const normalizedExt = normalizeExtension(ext);
-  const fileName = `${randomUUID()}.${normalizedExt}`;
-  const directoryPath = path.join(VIDEO_ROOT, userId);
-  const filePath = path.join(directoryPath, fileName);
-
-  await mkdir(directoryPath, { recursive: true });
-  await writeFile(filePath, buffer);
-
-  return getRelativeKey(userId, fileName);
+  try {
+    await s3Client.send(
+      new PutObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+        Body: buffer,
+      })
+    );
+  } catch (error) {
+    throw new Error(`Failed to save file at key "${key}": ${(error as Error).message}`);
+  }
 }
 
-export function getFilePath(userId: string, key: string): string {
+export async function getFileUrl(key: string): Promise<string> {
   if (!key.trim()) {
-    throw new Error("File key is required.");
+    throw new Error("A storage key is required to get a file URL.");
   }
-
-  const expectedPrefix = getUserPrefix(userId);
-  if (!key.startsWith(expectedPrefix)) {
-    throw new Error("File key does not belong to this user.");
-  }
-
-  return path.join(DATA_ROOT, key);
-}
-
-export async function deleteFile(userId: string, key: string): Promise<void> {
-  const filePath = getFilePath(userId, key);
 
   try {
-    await unlink(filePath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return;
-    }
+    const command = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+    });
 
-    throw new Error(`Failed to delete file at ${key}.`);
+    return await getSignedUrl(s3Client, command, { expiresIn: 3600 });
+  } catch (error) {
+    throw new Error(`Failed to generate signed URL for key "${key}": ${(error as Error).message}`);
+  }
+}
+
+export async function deleteFile(key: string): Promise<void> {
+  if (!key.trim()) {
+    throw new Error("A storage key is required to delete a file.");
+  }
+
+  try {
+    await s3Client.send(
+      new DeleteObjectCommand({
+        Bucket: bucketName,
+        Key: key,
+      })
+    );
+  } catch (error) {
+    throw new Error(`Failed to delete file at key "${key}": ${(error as Error).message}`);
   }
 }
