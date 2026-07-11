@@ -31,7 +31,11 @@ const s3Client = new S3Client({
   },
 });
 
-export async function saveFile(key: string, buffer: Buffer): Promise<void> {
+export async function saveFile(
+  key: string,
+  buffer: Buffer,
+  contentType?: string
+): Promise<void> {
   if (!key.trim()) {
     throw new Error("A storage key is required to save a file.");
   }
@@ -46,6 +50,7 @@ export async function saveFile(key: string, buffer: Buffer): Promise<void> {
         Bucket: bucketName,
         Key: key,
         Body: buffer,
+        ContentType: contentType,
       })
     );
   } catch (error) {

@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { getFile } from "../src/lib/storage";
 
-const VIDEO_KEY = "videos/test-user-worker/video.mp4";
+const VIDEO_KEY = "videos/test-400mb/video.mp4";
 
 async function main(): Promise<void> {
   const videoBuffer = await getFile(VIDEO_KEY);

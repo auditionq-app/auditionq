@@ -93,8 +93,8 @@ async function processJob(job: Job<VideoProcessingJobData>): Promise<void> {
     const videoKey = `videos/${userId}/video.mp4`;
     const thumbnailKey = `videos/${userId}/thumb.jpg`;
 
-    await saveFile(videoKey, videoBuffer);
-    await saveFile(thumbnailKey, thumbnailBuffer);
+    await saveFile(videoKey, videoBuffer, "video/mp4");
+    await saveFile(thumbnailKey, thumbnailBuffer, "image/jpeg");
 
     await db.video.update({
       where: { id: videoId },

@@ -8,7 +8,7 @@ import { db } from "@/lib/db";
 import { saveFile, deleteFile } from "@/lib/storage";
 import { videoProcessingQueue } from "@/lib/queue";
 
-const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_FILE_SIZE_BYTES = 400 * 1024 * 1024; // 400MB
 const MAX_DURATION_SECONDS = 60;
 const RATE_LIMIT_WINDOW_MS = 5000;
 
@@ -119,7 +119,7 @@ export async function POST(
     }
 
     try {
-      await saveFile(rawKey, buffer);
+      await saveFile(rawKey, buffer, file.type);
     } catch (error) {
       return errorResponse(
         `Failed to save file: ${(error as Error).message}`,

@@ -6,7 +6,7 @@ import { useParams } from "next/navigation";
 
 type UploadStatus = "idle" | "processing" | "uploading" | "success" | "error";
 
-const MAX_FILE_SIZE_MB = 50;
+const MAX_FILE_SIZE_MB = 400;
 const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
 
 function validateFileEarly(file: File): { valid: boolean; error?: string } {

@@ -1,119 +1,49 @@
-import { createReadStream } from "fs";
-import { stat } from "fs/promises";
-import { Readable } from "stream";
 import { NextRequest, NextResponse } from "next/server";
-
 import { db } from "@/lib/db";
-import { getFilePath } from "@/lib/storage";
+import { getFileUrl } from "@/lib/storage";
 
-export const runtime = "nodejs";
-
-type RouteContext = {
-	params: Promise<{ userId: string }>;
-};
-
-function jsonError(message: string, status: number): NextResponse {
-	return NextResponse.json({ error: message }, { status });
+function errorResponse(message: string, status: number): NextResponse {
+  return NextResponse.json({ error: message }, { status });
 }
 
-function parseRange(rangeHeader: string, fileSize: number): { start: number; end: number } | null {
-	const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
-	if (!match) {
-		return null;
-	}
+export async function GET(
+  request: NextRequest,
+  { params }: { params: Promise<{ userId: string }> }
+): Promise<NextResponse> {
+  const { userId } = await params;
 
-	const startText = match[1];
-	const endText = match[2];
+  if (!userId || !userId.trim()) {
+    return errorResponse("A userId is required.", 400);
+  }
 
-	if (!startText && !endText) {
-		return null;
-	}
+  const video = await db.video.findUnique({ where: { userId } });
 
-	if (!startText && endText) {
-		const suffixLength = Number.parseInt(endText, 10);
-		if (Number.isNaN(suffixLength) || suffixLength <= 0) {
-			return null;
-		}
+  if (!video) {
+    return errorResponse("No video found for this user.", 404);
+  }
 
-		const start = Math.max(fileSize - suffixLength, 0);
-		return { start, end: fileSize - 1 };
-	}
+  if (video.status === "processing") {
+    return NextResponse.json({ status: "processing" }, { status: 200 });
+  }
 
-	const start = Number.parseInt(startText, 10);
-	if (Number.isNaN(start) || start < 0 || start >= fileSize) {
-		return null;
-	}
+  if (video.status === "failed") {
+    return NextResponse.json(
+      { status: "failed", errorMessage: video.errorMessage },
+      { status: 200 }
+    );
+  }
 
-	if (!endText) {
-		return { start, end: fileSize - 1 };
-	}
+  if (video.status !== "ready" || !video.videoKey) {
+    return errorResponse("Video is not available.", 500);
+  }
 
-	const end = Number.parseInt(endText, 10);
-	if (Number.isNaN(end) || end < start) {
-		return null;
-	}
-
-	return { start, end: Math.min(end, fileSize - 1) };
-}
-
-export async function GET(request: NextRequest, context: RouteContext): Promise<NextResponse> {
-	try {
-		const { userId } = await context.params;
-
-		const video = await db.video.findUnique({
-			where: { userId },
-			select: { filePath: true },
-		});
-
-		if (!video) {
-			return jsonError("Video not found.", 404);
-		}
-
-		const absolutePath = getFilePath(userId, video.filePath);
-		const fileStats = await stat(absolutePath);
-		const fileSize = fileStats.size;
-
-		const rangeHeader = request.headers.get("range");
-		if (!rangeHeader) {
-			const stream = createReadStream(absolutePath);
-			return new NextResponse(Readable.toWeb(stream) as ReadableStream, {
-				status: 200,
-				headers: {
-					"Content-Type": "video/mp4",
-					"Content-Length": String(fileSize),
-					"Accept-Ranges": "bytes",
-					"Cache-Control": "no-store",
-				},
-			});
-		}
-
-		const parsedRange = parseRange(rangeHeader, fileSize);
-		if (!parsedRange) {
-			return new NextResponse(null, {
-				status: 416,
-				headers: {
-					"Content-Range": `bytes */${fileSize}`,
-					"Accept-Ranges": "bytes",
-				},
-			});
-		}
-
-		const { start, end } = parsedRange;
-		const chunkSize = end - start + 1;
-		const stream = createReadStream(absolutePath, { start, end });
-
-		return new NextResponse(Readable.toWeb(stream) as ReadableStream, {
-			status: 206,
-			headers: {
-				"Content-Type": "video/mp4",
-				"Content-Length": String(chunkSize),
-				"Content-Range": `bytes ${start}-${end}/${fileSize}`,
-				"Accept-Ranges": "bytes",
-				"Cache-Control": "no-store",
-			},
-		});
-	} catch (error) {
-		console.error("Video stream error:", error);
-		return jsonError("Failed to stream video.", 500);
-	}
+  try {
+    const signedUrl = await getFileUrl(video.videoKey);
+    return NextResponse.redirect(signedUrl);
+  } catch (error) {
+    return errorResponse(
+      `Failed to generate playback URL: ${(error as Error).message}`,
+      500
+    );
+  }
 }
