@@ -1,129 +1,202 @@
 import { NextRequest, NextResponse } from "next/server";
-import { saveFile, deleteFile } from "@/lib/storage";
+import { writeFile, unlink, mkdir } from "fs/promises";
+import path from "path";
+import os from "os";
+import { randomUUID } from "crypto";
+import ffmpeg from "fluent-ffmpeg";
 import { db } from "@/lib/db";
+import { saveFile, deleteFile } from "@/lib/storage";
+import { videoProcessingQueue } from "@/lib/queue";
 
-const MAX_FILE_SIZE_MB = 50;
-const MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024;
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_DURATION_SECONDS = 60;
+const RATE_LIMIT_WINDOW_MS = 5000;
 
-// Simple in-memory rate limiting: track upload attempts per user
-const uploadAttempts = new Map<string, number[]>();
-
-function jsonError(message: string, status: number): NextResponse {
-  return NextResponse.json({ error: message }, { status });
-}
+// Simple in-memory rate limiting: track last upload attempt per user
+const lastUploadAttempt = new Map<string, number>();
 
 function isRateLimited(userId: string): boolean {
   const now = Date.now();
-  const attempts = uploadAttempts.get(userId) ?? [];
-  const recentAttempts = attempts.filter((time) => now - time < 10000);
+  const last = lastUploadAttempt.get(userId);
 
-  if (
-    recentAttempts.length > 0 &&
-    now - recentAttempts[recentAttempts.length - 1] < 5000
-  ) {
+  if (last !== undefined && now - last < RATE_LIMIT_WINDOW_MS) {
     return true;
   }
 
-  recentAttempts.push(now);
-  uploadAttempts.set(userId, recentAttempts);
+  lastUploadAttempt.set(userId, now);
   return false;
+}
+
+function errorResponse(message: string, status: number): NextResponse {
+  return NextResponse.json({ error: message }, { status });
+}
+
+function getDurationSeconds(filePath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) {
+        reject(new Error(`ffprobe failed: ${err.message}`));
+        return;
+      }
+
+      const duration = metadata.format.duration;
+      if (typeof duration !== "number") {
+        reject(new Error("Could not determine video duration."));
+        return;
+      }
+
+      resolve(duration);
+    });
+  });
 }
 
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ userId: string }> }
 ): Promise<NextResponse> {
+  const { userId } = await params;
+
+  if (!userId || !userId.trim()) {
+    return errorResponse("A userId is required.", 400);
+  }
+
+  if (isRateLimited(userId)) {
+    return errorResponse("Too many upload attempts. Please wait a few seconds.", 429);
+  }
+
+  let formData: FormData;
   try {
-    const { userId } = await params;
+    formData = await request.formData();
+  } catch {
+    return errorResponse("Invalid form data.", 400);
+  }
 
-    if (!userId) {
-      return jsonError("userId is required.", 400);
-    }
+  const file = formData.get("video");
 
-    const userExists = await db.user.findUnique({ where: { id: userId } });
-    if (!userExists) {
-      return jsonError("User not found.", 404);
-    }
+  if (!(file instanceof File)) {
+    return errorResponse("A video file is required.", 400);
+  }
 
-    if (isRateLimited(userId)) {
-      return jsonError("Too many upload attempts. Please wait a few seconds.", 429);
-    }
+  if (!file.type.startsWith("video/")) {
+    return errorResponse("File must be a video.", 400);
+  }
 
-    const formData = await request.formData();
-    const videoFile = formData.get("video") as File | null;
+  if (file.size > MAX_FILE_SIZE_BYTES) {
+    return errorResponse(
+      `File is too large. Maximum size is ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB.`,
+      400
+    );
+  }
 
-    if (!videoFile) {
-      return jsonError("Video file is required.", 400);
-    }
+  const arrayBuffer = await file.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
 
-    if (videoFile.size > MAX_FILE_SIZE_BYTES) {
-      return jsonError(
-        `Video file is too large. Maximum size is ${MAX_FILE_SIZE_MB}MB.`,
+  const extension = path.extname(file.name) || ".mp4";
+  const rawKey = `raw/${userId}/${randomUUID()}${extension}`;
+
+  const tempDir = path.join(os.tmpdir(), `upload-check-${randomUUID()}`);
+  const tempFilePath = path.join(tempDir, `raw${extension}`);
+
+  try {
+    await mkdir(tempDir, { recursive: true });
+    await writeFile(tempFilePath, buffer);
+
+    let duration: number;
+    try {
+      duration = await getDurationSeconds(tempFilePath);
+    } catch (error) {
+      return errorResponse(
+        `Could not read video metadata: ${(error as Error).message}`,
         400
       );
     }
 
-    if (videoFile.type !== "video/mp4") {
-      return jsonError("Video must be in MP4 format.", 400);
+    if (duration > MAX_DURATION_SECONDS) {
+      return errorResponse(
+        "Video exceeds 60 seconds — please upload a version trimmed to the correct length.",
+        400
+      );
     }
 
-    const videoBuffer = Buffer.from(await videoFile.arrayBuffer());
-
-    let videoKey: string | null = null;
-
     try {
-      videoKey = await saveFile(userId, videoBuffer, "mp4");
-    } catch (saveError) {
-      console.error("Disk write failure during upload:", saveError);
-      return jsonError("Failed to save uploaded file.", 500);
+      await saveFile(rawKey, buffer);
+    } catch (error) {
+      return errorResponse(
+        `Failed to save file: ${(error as Error).message}`,
+        500
+      );
     }
 
-    const oldVideo = await db.video.findUnique({ where: { userId } });
-
-    let video: Awaited<ReturnType<typeof db.video.upsert>>;
+    let video;
     try {
+      await db.user.upsert({
+        where: { id: userId },
+        create: { id: userId },
+        update: {},
+      });
+
       video = await db.video.upsert({
         where: { userId },
-        update: {
-          filePath: videoKey,
-          thumbPath: null,
-          duration: null,
-          fileSizeBytes: videoFile.size,
-        },
         create: {
           userId,
-          filePath: videoKey,
-          thumbPath: null,
-          duration: null,
-          fileSizeBytes: videoFile.size,
+          status: "processing",
+          rawKey,
+        },
+        update: {
+          status: "processing",
+          rawKey,
+          errorMessage: null,
         },
       });
-    } catch (dbError) {
-      await deleteFile(userId, videoKey).catch(() => {
-        /* ignore deletion errors */
+    } catch (error) {
+      await deleteFile(rawKey).catch(() => {
+        // Best-effort cleanup; the DB error is the primary failure.
       });
-      throw dbError;
+      return errorResponse(
+        `Failed to create database record: ${(error as Error).message}`,
+        500
+      );
     }
 
-    if (oldVideo) {
-      if (oldVideo.filePath !== videoKey) {
-        await deleteFile(userId, oldVideo.filePath).catch(() => {
-          /* ignore deletion errors */
-        });
-      }
-      if (oldVideo.thumbPath) {
-        await deleteFile(userId, oldVideo.thumbPath).catch(() => {
-          /* ignore deletion errors */
-        });
-      }
+    try {
+      await videoProcessingQueue.add(
+        "process-video",
+        { videoId: video.id, userId, rawKey },
+        {
+          attempts: 3,
+          backoff: {
+            type: "exponential",
+            delay: 2000,
+          },
+        }
+      );
+    } catch (error) {
+      await deleteFile(rawKey).catch(() => {
+        // Best-effort cleanup.
+      });
+
+      await db.video.update({
+        where: { id: video.id },
+        data: {
+          status: "failed",
+          errorMessage: "Failed to queue processing job. Please try uploading again.",
+          rawKey: null,
+        },
+      }).catch(() => {
+        // If even this fails, the row stays in "processing" — a real edge case,
+        // but not one we can recover from cleanly here.
+      });
+
+      return errorResponse(
+        `Failed to queue processing job: ${(error as Error).message}`,
+        500
+      );
     }
 
-    return NextResponse.json(
-      { videoId: video.id, filePath: video.filePath, userId },
-      { status: 200 }
-    );
-  } catch (err) {
-    console.error("Upload error:", err);
-    return jsonError("Upload failed. Please try again.", 500);
+    return NextResponse.json({ videoId: video.id }, { status: 202 });
+  } finally {
+    await unlink(tempFilePath).catch(() => {
+      // Best-effort cleanup.
+    });
   }
 }
