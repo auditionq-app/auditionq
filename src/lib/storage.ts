@@ -70,6 +70,35 @@ export async function getFileUrl(key: string): Promise<string> {
   }
 }
 
+export async function getFile(key: string): Promise<Buffer> {
+  if (!key.trim()) {
+    throw new Error("A storage key is required to get a file.");
+  }
+
+  try {
+    const command = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: key,
+    });
+
+    const response = await s3Client.send(command);
+    const body = response.Body;
+
+    if (!body) {
+      throw new Error("No file body returned from R2.");
+    }
+
+    const chunks: Uint8Array[] = [];
+    for await (const chunk of body as AsyncIterable<Uint8Array>) {
+      chunks.push(chunk);
+    }
+
+    return Buffer.concat(chunks);
+  } catch (error) {
+    throw new Error(`Failed to get file at key "${key}": ${(error as Error).message}`);
+  }
+}
+
 export async function deleteFile(key: string): Promise<void> {
   if (!key.trim()) {
     throw new Error("A storage key is required to delete a file.");
