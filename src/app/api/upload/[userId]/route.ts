@@ -33,6 +33,7 @@ interface ParsedUpload {
   filename: string;
   mimeType: string;
   sizeExceeded: () => boolean;
+  done: Promise<void>;
 }
 
 function parseMultipartStream(
@@ -51,8 +52,51 @@ function parseMultipartStream(
       limits: { fileSize: MAX_FILE_SIZE_BYTES },
     });
 
-    let resolved = false;
+    let settled = false;
     let exceeded = false;
+    let videoFieldSeen = false;
+    let activeStream: PassThrough | null = null;
+    let requestEnded = false;
+
+    let finalizeDoneResolve: (() => void) | null = null;
+    let finalizeDoneReject: ((err: Error) => void) | null = null;
+    const done = new Promise<void>((doneResolve, doneReject) => {
+      finalizeDoneResolve = doneResolve;
+      finalizeDoneReject = doneReject;
+    });
+
+    function settleResolve(value: ParsedUpload): void {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    }
+
+    function settleReject(err: Error): void {
+      if (!settled) {
+        settled = true;
+        if (finalizeDoneReject) {
+          finalizeDoneReject(err);
+          finalizeDoneReject = null;
+          finalizeDoneResolve = null;
+        }
+        reject(err);
+        return;
+      }
+
+      // Already resolved and handed a stream to the caller — the only way
+      // to surface a late error now is to fail that stream directly, so
+      // whatever is consuming it (e.g. the R2 upload) gets a real error
+      // instead of hanging or silently succeeding on a corrupt/partial file.
+      if (activeStream && !activeStream.destroyed) {
+        activeStream.destroy(err);
+      }
+
+      if (finalizeDoneReject) {
+        finalizeDoneReject(err);
+        finalizeDoneReject = null;
+        finalizeDoneResolve = null;
+      }
+    }
 
     busboy.on("file", (fieldname, fileStream, info) => {
       if (fieldname !== "video") {
@@ -60,26 +104,51 @@ function parseMultipartStream(
         return;
       }
 
+      if (videoFieldSeen) {
+        fileStream.resume();
+        settleReject(new Error("Multiple video fields received; only one is allowed."));
+        return;
+      }
+
+      videoFieldSeen = true;
+
       const passThrough = new PassThrough();
+      activeStream = passThrough;
+
+      fileStream.on("error", (err) => {
+        settleReject(err instanceof Error ? err : new Error("File stream error."));
+      });
+
       fileStream.pipe(passThrough);
 
       fileStream.on("limit", () => {
         exceeded = true;
       });
 
-      if (!resolved) {
-        resolved = true;
-        resolve({
-          stream: passThrough,
-          filename: info.filename,
-          mimeType: info.mimeType,
-          sizeExceeded: () => exceeded,
-        });
-      }
+      settleResolve({
+        stream: passThrough,
+        filename: info.filename,
+        mimeType: info.mimeType,
+        sizeExceeded: () => exceeded,
+        done,
+      });
     });
 
     busboy.on("error", (err) => {
-      reject(err instanceof Error ? err : new Error("Busboy parsing error."));
+      settleReject(err instanceof Error ? err : new Error("Busboy parsing error."));
+    });
+
+    busboy.on("finish", () => {
+      if (!videoFieldSeen) {
+        settleReject(new Error("No video field found in the upload."));
+        return;
+      }
+
+      if (finalizeDoneResolve) {
+        finalizeDoneResolve();
+        finalizeDoneResolve = null;
+        finalizeDoneReject = null;
+      }
     });
 
     if (!request.body) {
@@ -90,6 +159,21 @@ function parseMultipartStream(
     const nodeStream = Readable.fromWeb(
       request.body as unknown as import("stream/web").ReadableStream
     );
+
+    nodeStream.on("end", () => {
+      requestEnded = true;
+    });
+
+    nodeStream.on("error", (err) => {
+      settleReject(err instanceof Error ? err : new Error("Request stream error."));
+    });
+
+    nodeStream.on("close", () => {
+      if (!requestEnded) {
+        settleReject(new Error("Upload request closed before completion."));
+      }
+    });
+
     nodeStream.pipe(busboy);
   });
 }
@@ -128,6 +212,7 @@ export async function POST(
 
   try {
     await saveFileStream(rawKey, parsed.stream, parsed.mimeType);
+    await parsed.done;
   } catch (error) {
     return errorResponse(
       `Failed to save file: ${(error as Error).message}`,
@@ -136,8 +221,8 @@ export async function POST(
   }
 
   if (parsed.sizeExceeded()) {
-    await deleteFile(rawKey).catch(() => {
-      // Best-effort cleanup.
+    await deleteFile(rawKey).catch((err) => {
+      console.error(`Failed to clean up oversized upload at ${rawKey}:`, err);
     });
     return errorResponse(
       `File is too large. Maximum size is ${MAX_FILE_SIZE_BYTES / (1024 * 1024)}MB.`,
