@@ -147,6 +147,48 @@ export default function UploadPage(): React.JSX.Element {
     });
   }
 
+  async function pollForCompletion(targetUserId: string): Promise<void> {
+const POLL_INTERVAL_MS = 3000;
+const MAX_ATTEMPTS = 100; // ~5 minutes total
+
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+
+      const response = await fetch(`/api/videos/${targetUserId}`, {
+        redirect: "manual",
+      });
+
+      // A redirect (opaqueredirect) means the video is ready and playable.
+      if (response.type === "opaqueredirect" || response.status === 0) {
+        setProfileUserId(targetUserId);
+        setStatus("success");
+        return;
+      }
+
+      if (response.ok) {
+        const statusData: unknown = await response.json();
+        const parsed = statusData as { status?: string; errorMessage?: string };
+
+        if (parsed.status === "failed") {
+          setStatus("error");
+          setErrorMessage(parsed.errorMessage || "Video processing failed.");
+          return;
+        }
+
+        // status is "processing" — keep polling
+        continue;
+      }
+
+      // Non-ok, non-redirect response — treat as an error
+      setStatus("error");
+      setErrorMessage("Something went wrong while checking video status.");
+      return;
+    }
+
+    setStatus("error");
+    setErrorMessage("Processing is taking longer than expected. Check back later.");
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
 
@@ -180,10 +222,10 @@ export default function UploadPage(): React.JSX.Element {
         throw new Error(errorData.error || "Upload failed.");
       }
 
-      setProfileUserId(userId);
-      setStatus("success");
-      setErrorMessage("");
       setUploadProgress(100);
+      setStatus("processing");
+      setErrorMessage("");
+      await pollForCompletion(userId);
     } catch (err) {
       setStatus("error");
       setErrorMessage(err instanceof Error ? err.message : "Upload failed. Please try again.");

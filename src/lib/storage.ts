@@ -5,6 +5,9 @@ import {
   GetObjectCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { Upload } from "@aws-sdk/lib-storage";
+import type { Readable } from "stream";
+
 
 const requiredEnvVars = [
   "R2_ACCOUNT_ID",
@@ -55,6 +58,34 @@ export async function saveFile(
     );
   } catch (error) {
     throw new Error(`Failed to save file at key "${key}": ${(error as Error).message}`);
+  }
+}
+
+export async function saveFileStream(
+  key: string,
+  stream: Readable,
+  contentType?: string
+): Promise<void> {
+  if (!key.trim()) {
+    throw new Error("A storage key is required to save a file.");
+  }
+
+  try {
+    const upload = new Upload({
+      client: s3Client,
+      params: {
+        Bucket: bucketName,
+        Key: key,
+        Body: stream,
+        ContentType: contentType,
+      },
+    });
+
+    await upload.done();
+  } catch (error) {
+    throw new Error(
+      `Failed to stream file to key "${key}": ${(error as Error).message}`
+    );
   }
 }
 
