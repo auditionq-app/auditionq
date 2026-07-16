@@ -40,7 +40,13 @@ function transcodeToMp4(inputPath: string, outputPath: string): Promise<void> {
     ffmpeg(inputPath)
       .videoCodec("libx264")
       .audioCodec("aac")
-      .outputOptions(["-movflags faststart"])
+      .audioBitrate("96k")
+      .outputOptions([
+        "-crf 27",
+        "-preset medium",
+        "-vf scale='min(1280,iw)':-2",
+        "-movflags faststart",
+      ])
       .on("end", () => resolve())
       .on("error", (err) => reject(new Error(`Transcoding failed: ${err.message}`)))
       .save(outputPath);
